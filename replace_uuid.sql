@@ -1,125 +1,131 @@
--- Первая таблица (по ней считаем лимиты)
--- PK = uuid
--- app.parent_entity(id uuid primary key, ...)
-
--- Вторая таблица (отношение 1:N)
--- app.child_entity(id bigint primary key, parent_id uuid not null, ...)
-
 BEGIN;
 
--- Лог-таблицы (создаются один раз, если не были созданы)
-CREATE TABLE IF NOT EXISTS app.uuid_replace_parent_log (
-    log_id      bigserial PRIMARY KEY,
-    batch_id    uuid NOT NULL,          -- идентификатор запуска
-    entity_id   uuid NOT NULL,          -- PK первой таблицы до замены
-    old_uuid    uuid NOT NULL,          -- старое значение
-    new_uuid    uuid NOT NULL,          -- новое значение
-    created_at  timestamptz NOT NULL DEFAULT now()
+-- Лог-таблицы (создаются один раз, если нет)
+
+CREATE TABLE IF NOT EXISTS triage.uuid_replace_control_object_log (
+    log_id          bigserial PRIMARY KEY,
+    batch_id        uuid NOT NULL,          -- идентификатор запуска
+    parent_uuid     uuid NOT NULL,          -- triage.control_object.uuid
+    old_preset_uuid uuid NOT NULL,          -- preset_uuid до
+    new_preset_uuid uuid NOT NULL,          -- preset_uuid после
+    created_at      timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS app.uuid_replace_child_log (
+CREATE TABLE IF NOT EXISTS triage.uuid_replace_repository_control_object_log (
     log_id          bigserial PRIMARY KEY,
     batch_id        uuid NOT NULL,
-    child_id        bigint NOT NULL,    -- PK второй таблицы
-    old_parent_uuid uuid NOT NULL,      -- parent_id до
-    new_parent_uuid uuid NOT NULL,      -- parent_id после
+    child_uuid      uuid NOT NULL,          -- triage.repository_control_object.uuid
+    parent_uuid     uuid NOT NULL,          -- triage.repository_control_object.parent_uuid
+    old_preset_uuid uuid NOT NULL,          -- preset_uuid до
+    new_preset_uuid uuid NOT NULL,          -- preset_uuid после
     created_at      timestamptz NOT NULL DEFAULT now()
 );
 
 WITH
--- 1. Кандидаты в первой таблице под старый uuid
+-- 1. Родители-кандидаты: у кого preset_uuid = old_uuid
 candidate_parents AS (
-    SELECT p.id AS old_uuid
-    FROM app.parent_entity AS p
-    WHERE p.id = :'old_uuid'::uuid
-    ORDER BY p.id
+    SELECT p.uuid AS parent_uuid
+    FROM triage.control_object AS p
+    WHERE p.preset_uuid = :'old_uuid'::uuid
+    ORDER BY p.uuid
 ),
 
--- 2. Ограничиваемся лимитом по первой таблице
+-- 2. Ограничиваемся лимитом по родителям
 selected_parents AS (
-    SELECT cp.old_uuid
+    SELECT cp.parent_uuid
     FROM candidate_parents AS cp
     LIMIT GREATEST(:'parent_limit'::bigint, 0)
 ),
 
 -- 3. Общая статистика до замены
 parent_total_before AS (
-    SELECT COUNT(*) AS cnt FROM app.parent_entity
+    SELECT COUNT(*) AS cnt FROM triage.control_object
 ),
 child_total_before AS (
-    SELECT COUNT(*) AS cnt FROM app.child_entity
+    SELECT COUNT(*) AS cnt FROM triage.repository_control_object
 ),
 
 -- 4. Сколько реально подходит под замену
 parent_target_before AS (
     SELECT COUNT(*) AS cnt
-    FROM app.parent_entity AS p
-    JOIN selected_parents AS sp ON p.id = sp.old_uuid
+    FROM triage.control_object AS p
+    JOIN selected_parents AS sp ON p.uuid = sp.parent_uuid
 ),
 child_target_before AS (
     SELECT COUNT(*) AS cnt
-    FROM app.child_entity AS c
-    JOIN selected_parents AS sp ON c.parent_id = sp.old_uuid
+    FROM triage.repository_control_object AS c
+    JOIN selected_parents AS sp ON c.parent_uuid = sp.parent_uuid
+    WHERE c.preset_uuid = :'old_uuid'::uuid
 ),
 
--- 5. Логируем изменения первой таблицы
+-- 5. Логируем изменения родителей
 logged_parent AS (
-    INSERT INTO app.uuid_replace_parent_log (batch_id, entity_id, old_uuid, new_uuid)
+    INSERT INTO triage.uuid_replace_control_object_log (
+        batch_id, parent_uuid, old_preset_uuid, new_preset_uuid
+    )
     SELECT
-        :'batch_id'::uuid AS batch_id,
-        p.id              AS entity_id,
-        sp.old_uuid       AS old_uuid,
-        :'new_uuid'::uuid AS new_uuid
-    FROM app.parent_entity AS p
-    JOIN selected_parents AS sp ON p.id = sp.old_uuid
-    RETURNING entity_id
+        :'batch_id'::uuid,
+        p.uuid,
+        :'old_uuid'::uuid,
+        :'new_uuid'::uuid
+    FROM triage.control_object AS p
+    JOIN selected_parents AS sp ON p.uuid = sp.parent_uuid
+    RETURNING parent_uuid
 ),
 
--- 6. Обновляем первую таблицу
+-- 6. Обновляем preset_uuid у родителей
 updated_parent AS (
-    UPDATE app.parent_entity AS p
-    SET id = :'new_uuid'::uuid
+    UPDATE triage.control_object AS p
+    SET preset_uuid = :'new_uuid'::uuid
     FROM selected_parents AS sp
-    WHERE p.id = sp.old_uuid
-    RETURNING p.id AS new_id
+    WHERE p.uuid = sp.parent_uuid
+      AND p.preset_uuid = :'old_uuid'::uuid
+    RETURNING p.uuid AS parent_uuid
 ),
 
--- 7. Логируем изменения второй таблицы
+-- 7. Логируем изменения детей
 logged_child AS (
-    INSERT INTO app.uuid_replace_child_log (batch_id, child_id, old_parent_uuid, new_parent_uuid)
+    INSERT INTO triage.uuid_replace_repository_control_object_log (
+        batch_id, child_uuid, parent_uuid, old_preset_uuid, new_preset_uuid
+    )
     SELECT
-        :'batch_id'::uuid AS batch_id,
-        c.id              AS child_id,
-        sp.old_uuid       AS old_parent_uuid,
-        :'new_uuid'::uuid AS new_parent_uuid
-    FROM app.child_entity AS c
-    JOIN selected_parents AS sp ON c.parent_id = sp.old_uuid
-    RETURNING child_id
+        :'batch_id'::uuid,
+        c.uuid,
+        c.parent_uuid,
+        :'old_uuid'::uuid,
+        :'new_uuid'::uuid
+    FROM triage.repository_control_object AS c
+    JOIN selected_parents AS sp ON c.parent_uuid = sp.parent_uuid
+    WHERE c.preset_uuid = :'old_uuid'::uuid
+    RETURNING child_uuid
 ),
 
--- 8. Обновляем вторую таблицу
+-- 8. Обновляем preset_uuid у детей
 updated_child AS (
-    UPDATE app.child_entity AS c
-    SET parent_id = :'new_uuid'::uuid
+    UPDATE triage.repository_control_object AS c
+    SET preset_uuid = :'new_uuid'::uuid
     FROM selected_parents AS sp
-    WHERE c.parent_id = sp.old_uuid
-    RETURNING c.id AS child_id
+    WHERE c.parent_uuid = sp.parent_uuid
+      AND c.preset_uuid = :'old_uuid'::uuid
+    RETURNING c.uuid AS child_uuid
 )
 
 -- 9. Простая статистика "было / заменили / стало"
 SELECT
-    -- Первая таблица
-    (SELECT cnt FROM parent_total_before)                                       AS parent_total_before,
-    (SELECT cnt FROM parent_target_before)                                      AS parent_target_before,
-    (SELECT COUNT(*) FROM updated_parent)                                       AS parent_replaced,
-    (SELECT COUNT(*) FROM app.parent_entity AS p
-      WHERE p.id = :'new_uuid'::uuid)                                           AS parent_target_after,
+    -- Родители
+    (SELECT cnt FROM parent_total_before)                                         AS parent_total_before,
+    (SELECT cnt FROM parent_target_before)                                        AS parent_target_before,
+    (SELECT COUNT(*) FROM updated_parent)                                         AS parent_replaced,
+    (SELECT COUNT(*) FROM triage.control_object AS p
+      JOIN selected_parents AS sp ON p.uuid = sp.parent_uuid
+      WHERE p.preset_uuid = :'new_uuid'::uuid)                                    AS parent_target_after,
 
-    -- Вторая таблица
-    (SELECT cnt FROM child_total_before)                                        AS child_total_before,
-    (SELECT cnt FROM child_target_before)                                       AS child_target_before,
-    (SELECT COUNT(*) FROM updated_child)                                        AS child_replaced,
-    (SELECT COUNT(*) FROM app.child_entity AS c
-      WHERE c.parent_id = :'new_uuid'::uuid)                                    AS child_target_after;
+    -- Дети
+    (SELECT cnt FROM child_total_before)                                          AS child_total_before,
+    (SELECT cnt FROM child_target_before)                                         AS child_target_before,
+    (SELECT COUNT(*) FROM updated_child)                                          AS child_replaced,
+    (SELECT COUNT(*) FROM triage.repository_control_object AS c
+      JOIN selected_parents AS sp ON c.parent_uuid = sp.parent_uuid
+      WHERE c.preset_uuid = :'new_uuid'::uuid)                                    AS child_target_after;
 
 COMMIT;
